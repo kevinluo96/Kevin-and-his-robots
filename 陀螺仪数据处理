@@ -1,0 +1,30 @@
+#include "I2Cdev.h"      //通讯协议
+#include "Wire.h"  
+#include "MPU6050_6Axis_MotionApps20.h"//MPU6050库文件
+#include <KalmanFilter.h>    //卡尔曼滤波
+float K1 = 0.05; // 对加速度计取值的权重
+float Q_angle = 0.001, Q_gyro = 0.005;
+float R_angle = 0.5 , C_0 = 1;
+float dt = 0.005; //注意：dt的取值为滤波器采样时间 5ms
+int addr = 0;
+int Angle;
+KalmanFilter KalFilter;//实例化一个卡尔曼滤波器对象，对象名称为 KalFilter
+MPU6050 Mpu6050; //实例化一个 MPU6050 对象，对象名称为 Mpu6050
+int16_t ax, ay, az, gx, gy, gz;  //MPU6050的三轴加速度和三轴陀螺仪数据
+void setup() {
+  // put your setup code here, to run once:
+  Wire.begin();             //加入 IIC 总线
+  Serial.begin(9600);       //开启串口，设置波特率为 9600
+  Mpu6050.initialize();     //初始化MPU6050
+  delay(1000);
+
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  Mpu6050.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);  //获取MPU6050陀螺仪和加速度计的数据
+  KalFilter.Angletest(ax, ay, az, gx, gy, gz, dt, Q_angle, Q_gyro, R_angle, C_0, K1);          //通过卡尔曼滤波获取角度
+  Angle = KalFilter.angle;//Angle是一个用于显示的整形变量
+  Serial.println(Angle);
+  delay(5);
+}
