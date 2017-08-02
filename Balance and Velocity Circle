@@ -1,0 +1,256 @@
+#include "I2Cdev.h"      //通讯协议
+#include "Wire.h"
+#include "Math.h"
+#include "MPU6050_6Axis_MotionApps20.h"//MPU6050库文件
+#include <KalmanFilter.h>    //卡尔曼滤波
+#include <FlexiTimer2.h> //定时中断 
+#define PIN1 39 //TB6612驱动模块控制信号6个 
+#define PIN2 40
+#define PIN3 52
+#define PIN4 53
+#define PWMA 7
+#define PWMB 6
+#define ENCODER_L 2 //编码器采集引脚 每路2个 共4个 
+#define DIRECTION_L 5
+#define ENCODER_R 3
+#define DIRECTION_R 8
+
+volatile long Velocity_L, Velocity_R = 0;  //左右轮编码器数据
+int Velocity_Left, Velocity_Right = 0;  //左右轮速度
+int Motor_L, Motor_R; //电机叠加后的PWM值
+int Flag_Forward, Flag_Backward, Flag_Left, Flag_Right; //遥控相关变量
+int16_t ax, ay, az, gx, gy, gz;  //MPU6050的三轴加速度和三轴陀螺仪数据
+float Median = 6; //平衡中值变量
+int Angle = 0;
+unsigned int Flag_Stop = 1;
+int Balance_Pwm, Velocity_Pwm, Turn_Pwm;
+float Battery_Voltage;   //电池电压 单位是V
+float Balance_Kp = -8, Balance_Kd = 1, Velocity_Kp = -2.2, Velocity_Ki = Velocity_Kp/200; //直立速度调节变量
+//***卡尔曼滤波相关变量***//
+float K1 = 0.02; // 对加速度计取值的权重
+float Q_angle = 0.001, Q_gyro = 0.005;
+float R_angle = 0.5 , C_0 = 1;
+float dt = 0.005; //注意：dt的取值为滤波器采样时间 5ms
+int addr = 0;
+KalmanFilter KalFilter;//实例化一个卡尔曼滤波器对象，对象名称为 KalFilter
+MPU6050 Mpu6050; //实例化一个 MPU6050 对象，对象名称为 Mpu6050
+
+int Pick_Up(float Acceleration, float Angle, int encoder_left, int encoder_right){
+  static unsigned int flag, count0, count1, count2;
+  if (flag == 0) //第一步
+  {
+    if (abs(encoder_left) + abs(encoder_right) < 15)         count0++;  //条件1，小车接近静止
+    else       count0 = 0;
+    if (count0 > 10)      flag = 1, count0 = 0;
+  }
+  if (flag == 1) //进入第二步
+  {
+    if (++count1 > 400)       count1 = 0, flag = 0;                         //超时不再等待2000ms
+    if (Acceleration > 22000 && (Angle > (-14 + Median)) && (Angle < (14 + Median)))  flag = 2; //条件2，小车是在0度附近被拿起
+  }
+  if (flag == 2)  //第三步
+  {
+    if (++count2 > 200)       count2 = 0, flag = 0;       //超时不再等待1000ms
+    if (abs(encoder_left + encoder_right) > 300)           //条件3，小车的轮胎因为正反馈达到最大的转速      
+     {
+        flag = 0;  return 1;
+      }                                           
+  }
+  return 0;
+}
+/**************************************************************************
+函数功能：检测小车是否被放下 作者：平衡小车之家
+入口参数： 平衡倾角 左轮编码器 右轮编码器
+返回  值：0：无事件 1：小车放置并启动
+**************************************************************************/
+int Put_Down(float Angle, int encoder_left, int encoder_right){
+  static u16 flag, count;
+  if (Flag_Stop == 0)         return 0;                   //防止误检
+  if (flag == 0)
+  {
+    if (Angle > (-10 + Median) && Angle < (10 + Median) && encoder_left == 0 && encoder_right == 0)      flag = 1; //条件1，小车是在0度附近的
+  }
+  if (flag == 1)
+  {
+    if (++count > 100)       count = 0, flag = 0;  //超时不再等待 500ms
+    if (encoder_left > 12 && encoder_right > 12 && encoder_left < 80 && encoder_right < 80) //条件2，小车的轮胎在未上电的时候被人为转动
+    {
+      flag = 0;
+      return 1;    //检测到小车被放下
+    }
+  }
+  return 0;
+}
+
+unsigned char Turn_Off(float angle,unsigned char Flag_Stop )  //异常状态关闭函数
+{
+  unsigned char temp;
+  if (angle < -40 || angle > 40 || 1 == Flag_Stop ) // ===倾角大于40度关闭电机//===Flag_Stop置1关闭电机
+  {
+    temp = 1;
+  }
+  else    temp = 0;   //不存在异常，返回0
+  return temp;
+}
+
+void Set_PWM(int Motor_L, int Motor_R) {    //控制电机转速和转向
+  if (Motor_R < 0) {
+    digitalWrite(PIN3, LOW);  //TB6612的电平控制
+    digitalWrite(PIN4, HIGH);
+  }
+  else {
+    digitalWrite(PIN3, HIGH);
+    digitalWrite(PIN4, LOW);
+  }
+  analogWrite(PWMB, abs(Motor_R));
+  if (Motor_L > 0) {
+    digitalWrite(PIN1, HIGH);  //TB6612的电平控制
+    digitalWrite(PIN2, LOW);
+  }
+  else {
+    digitalWrite(PIN1, LOW);
+    digitalWrite(PIN2, HIGH);
+  }
+  analogWrite(PWMA, abs(Motor_L));
+}
+void Restriction_PWM(void) {  //限速函数
+  int Amplitude = 200;  //===PWM满幅是255 限制在250
+  if (Motor_L < -Amplitude) Motor_L = -Amplitude;
+  if (Motor_L > Amplitude) Motor_L = Amplitude;
+  if (Motor_R < -Amplitude) Motor_R = -Amplitude;
+  if (Motor_R > Amplitude) Motor_R = Amplitude;
+}
+void setup() {
+  // put your setup code here, to run once:
+  Wire.begin();             //加入 IIC 总线
+  Mpu6050.initialize();     //初始化MPU6050
+  pinMode(PIN1, OUTPUT); //TB6612控制引脚，控制电机1的方向，01为正转，10为反转
+  pinMode(PIN2, OUTPUT);
+  pinMode(PIN3, OUTPUT);
+  pinMode(PIN4, OUTPUT);
+  pinMode(PWMA, OUTPUT); //TB6612控制引脚，电机PWM
+  pinMode(PWMB, OUTPUT);
+  digitalWrite(PIN1, 0); //TB6612控制引脚拉低
+  digitalWrite(PIN2, 0); //TB6612控制引脚拉低
+  digitalWrite(PIN3, 0); //TB6612控制引脚拉低
+  digitalWrite(PIN4, 0); //TB6612控制引脚拉低
+  analogWrite(PWMA, 0); //TB6612控制引脚拉低
+  analogWrite(PWMB, 0); //TB6612控制引脚拉低
+  pinMode(ENCODER_L, INPUT); //编码器引脚
+  pinMode(DIRECTION_L, INPUT);
+  pinMode(ENCODER_R, INPUT);
+  pinMode(DIRECTION_R, INPUT);
+  delay(3000);  //启动准备延迟
+  attachInterrupt(0, READ_ENCODER_L, CHANGE); //开启外部中断，编码器1
+  attachInterrupt(1, READ_ENCODER_R, CHANGE); //开启外部中断，编码器2
+  FlexiTimer2::set(5, control); //使用Timer2设置5ms定时中断
+  FlexiTimer2::start(); //使用中断功能
+  Serial.begin(9600); //开启串口，设置波特率为9600
+}
+void READ_ENCODER_L() {
+  //外部中断读取编码器数据，跳变沿触发
+  if (digitalRead(ENCODER_L) == LOW) { //如果是下降沿触发的中断
+    if (digitalRead(DIRECTION_L) == LOW) {
+      Velocity_L++;
+    }
+    else {
+      Velocity_L--;
+    }
+  }
+  else { //如果是上升沿触发的中断
+    if (digitalRead(DIRECTION_L) == LOW) {
+      Velocity_L--;
+    }
+    else {
+      Velocity_L++;
+    }
+  }
+}
+void READ_ENCODER_R() { //外部中断读取编码器数据，跳变沿触发
+  if (digitalRead(ENCODER_R) == LOW) { //如果是下降沿触发的中断
+    if (digitalRead(DIRECTION_R) == LOW) {
+      Velocity_R--;
+    }
+    else {
+      Velocity_R++;
+    }
+  }
+  else { //如果是上升沿触发的中断
+    if (digitalRead(DIRECTION_R) == LOW) {
+      Velocity_R++;
+    }
+    else {
+      Velocity_R--;
+    }
+  }
+}
+int balance(float Angle, float Gyro) { //直立PD控制
+  float Bias;
+  int balance;
+  Bias = Angle - Median;
+  balance = Balance_Kp * Bias + Balance_Kd * Gyro; //计算直立PWM
+  return balance;
+}
+int velocity(int Encoder_Left, int Encoder_Right)
+{
+  static float Velocity, Encoder_Latest, Encoder, Movement;
+  static float Encoder_Integral;
+  //if (Flag_Forward == 1)   Movement = -90; //前进时位移为负
+  //if (Flag_Backward == 1)   Movement = 90; //后退时位移为正
+   Movement = 0;
+  Encoder_Latest = (Encoder_Left + Encoder_Right) - 0;
+  Encoder *= 0.7;
+  Encoder += Encoder_Latest * 0.3;
+  Encoder_Integral += Encoder;
+  Encoder_Integral -= Movement;
+  if (Encoder_Integral > 1000) Encoder_Integral = 1000; //积分限幅
+  if (Encoder_Integral < -1000) Encoder_Integral = -1000;
+  Velocity = Encoder * Velocity_Kp + Encoder_Integral * Velocity_Ki;
+  return Velocity;
+}
+void control()  //定时中断函数5ms
+{
+  //竖直方向为z轴，前进方向为x轴
+  sei();
+  static int Velocity_Count, Turn_Count, Encoder_Count;
+  static float Voltage_All,Voltage_Count;
+  int Temp;
+  if (++Velocity_Count >= 8) //速度控制，控制周期40ms
+  {
+    Velocity_Left = Velocity_L;    Velocity_L = 0;  //读取左轮编码器数据，并清零，这就是通过M法测速（单位时间内的脉冲数）得到速度。
+    Velocity_Right = Velocity_R;    Velocity_R = 0; //读取右轮编码器数据，并清零
+    //Velocity_Pwm = velocity(Velocity_Left, Velocity_Right);//速度PI控制，控制周期40ms
+    Velocity_Count = 0;
+    //Serial.print("v:");
+   // Serial.println(Velocity_Left);
+   // Serial.print("m:");
+   // Serial.println(Velocity_Pwm);
+  }
+  Mpu6050.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);  //获取MPU6050陀螺仪和加速度计的数据
+  KalFilter.Angletest(ax, ay, az, gx, gy, gz, dt, Q_angle, Q_gyro, R_angle, C_0, K1);          //通过卡尔曼滤波获取角度
+  Angle = KalFilter.angle;//Angle是一个用于显示的整形变量
+  Balance_Pwm = balance(KalFilter.angle6, KalFilter.Gyro_y);//直立PD控制 控制周期5ms
+  Motor_L = Balance_Pwm + Velocity_Pwm;
+  Motor_R = Balance_Pwm + Velocity_Pwm;
+  Restriction_PWM();  //限幅
+ // Serial.println(KalFilter.angle6);
+ if (Pick_Up(az, KalFilter.angle6, Velocity_Left, Velocity_Right))   Flag_Stop = 1;  //===如果被拿起就关闭电机//===检查是否小车被那起
+ if (Put_Down(KalFilter.angle6, Velocity_Left, Velocity_Right))      Flag_Stop = 0;  
+ Serial.println(Motor_L);
+ Set_PWM(Motor_L,Motor_R);
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+
+  static int flag;
+  /*******
+  while (Serial.available() > 0) {
+    flag=Serial.read();
+  }
+  if(flag==49)  Flag_Forward=1, Flag_Backward=0;
+  if(flag==50)  Flag_Forward=0, Flag_Backward=1;  
+  else Flag_Forward=0, Flag_Backward=0; 
+  ******/
+ 
+}
